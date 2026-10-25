@@ -10,6 +10,7 @@ import subprocess
 import json
 import re
 import ollama
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -408,9 +409,87 @@ def gather_context() -> str:
             pass
     return "\n\n".join(parts)
 
+# ── shellgpt-style one-shot mode ───────────────────────────────────────────────
+SHELL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string"},
+        "explanation": {"type": "string"},
+    },
+    "required": ["command", "explanation"],
+}
+
+def generate_command(request: str) -> tuple[str, str]:
+    sh = os.path.basename(os.environ.get("SHELL", "bash"))
+    sys_prompt = (
+        f"Translate the user's request into exactly ONE {sh} command for "
+        f"{subprocess.getoutput('uname -sr')} (Parrot/Debian-based). "
+        "Single line, no markdown, no placeholders, prefer standard tools. "
+        "If the request is impossible or unsafe to express as one command, "
+        "return command as 'false' and explain why. "
+        "Explanation: one short sentence."
+    )
+    r = ollama.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": f"cwd: {os.getcwd()}\nrequest: {request}"},
+        ],
+        format=SHELL_SCHEMA,
+        options={"temperature": 0, "num_ctx": 4096},
+    )
+    data = json.loads(r["message"]["content"])
+    return data["command"].strip(), data["explanation"].strip()
+
+
+def shell_mode(request: str, print_only: bool) -> int:
+    try:
+        cmd, why = generate_command(request)
+    except Exception as e:
+        print(f"{RED}model error: {e}{RESET}", file=sys.stderr)
+        return 1
+
+    if print_only:               # for the zsh widget: stdout = command, nothing else
+        print(cmd)
+        return 0
+
+    if is_blocked(cmd):
+        print(f"{RED}BLOCKED:{RESET} {cmd}", file=sys.stderr)
+        return 1
+
+    color = RED if is_dangerous(cmd) else GREEN
+    print(f"\n{color}{cmd}{RESET}\n{DIM}{why}{RESET}\n")
+    try:
+        ans = input("[e]xecute / [a]bort (default a): ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return 130
+    if ans not in ("e", "execute"):
+        return 0
+
+    return subprocess.run(
+        cmd, shell=True, executable=os.environ.get("SHELL", "/bin/bash")
+    ).returncode
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(prog="localai")
+    ap.add_argument("-s", "--shell", action="store_true",
+                    help="one-shot: turn request into a shell command")
+    ap.add_argument("-p", "--print", action="store_true",
+                    help="with --shell: only print the command, never run it")
+    ap.add_argument("-m", "--model", help="override model")
+    ap.add_argument("request", nargs="*")
+    return ap.parse_args()
 
 def main():
     global MODEL
+    args = parse_args()
+    if args.model:
+        MODEL = args.model
+    if args.request or args.shell:
+        if not args.request:
+            sys.exit("usage: ai <what you want>")
+        sys.exit(shell_mode(" ".join(args.request), args.print))
     print(f"{BOLD}{CYAN}localai{RESET} — model: {MODEL}")
     print(f"{DIM}type 'exit' to quit | 'model <name>' to switch | 'clear' to reset context{RESET}")
     print_separator()
